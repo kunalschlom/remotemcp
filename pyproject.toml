@@ -9,5 +9,5 @@ dependencies = [
     "asyncpg>=0.31.0",
     "bcrypt>=5.0.0",
     "fastmcp>=2.14.2",
-    "psycopg2>=2.9.11",
+    "psycopg2-binary==2.9.11",
 ]
