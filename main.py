@@ -447,8 +447,8 @@ async def delete_task(token:str,task_id: int):
 # --------------------------
     
 
-initialise_db()
+
 if __name__ == "__main__":
-    
+    initialise_db()
 
     mcp.run(transport='http',host='0.0.0.0',port=8000,debug=True)
