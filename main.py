@@ -1,4 +1,3 @@
-
 from fastmcp import FastMCP
 import asyncpg
 import psycopg2
@@ -8,13 +7,27 @@ import hmac
 import hashlib
 import base64
 import json
+from dotenv import load_dotenv
+import os
 
+# Load environment variables
+load_dotenv()
+
+# Database configuration
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST"),
+    "port": int(os.getenv("DB_PORT", "5432")),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "database": os.getenv("DB_NAME"),
+    "ssl": "require"  # REQUIRED for Supabase
+}
 
 # Initialize MCP
 mcp = FastMCP(name="project remote management")
 
 # SECRET for token signing
-SECRET_KEY = b"super-secret-key"
+SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-key").encode()
 
 # --------------------------
 # Utility: Token handling
@@ -61,38 +74,7 @@ def require_user(token: str):
 # --------------------------
 # Database Initialization
 # --------------------------
-def initialise_db():
-    conn = psycopg2.connect(
-        host="localhost",
-        port=5432,
-        user="postgres",
-        password="kunal",
-        database="projectmanagement"
-    )
-    cur = conn.cursor()
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            task_id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL REFERENCES users(id),
-            task_name TEXT NOT NULL,
-            due_date DATE,
-            priority TEXT,
-            status TEXT DEFAULT 'pending'
-        )
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
 
 
 # --------------------------
@@ -100,13 +82,10 @@ def initialise_db():
 # --------------------------
 @mcp.tool
 async def register(email: str, password: str):
+    """Register a new user"""
     hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
-    conn = await asyncpg.connect(
-        host="localhost", port=5432,
-        user="postgres", password="kunal",
-        database="projectmanagement"
-    )
+    conn = await asyncpg.connect(**DB_CONFIG)
 
     try:
         await conn.execute(
@@ -126,11 +105,8 @@ async def register(email: str, password: str):
 # --------------------------
 @mcp.tool
 async def login(email: str, password: str):
-    conn = await asyncpg.connect(
-        host="localhost", port=5432,
-        user="postgres", password="kunal",
-        database="projectmanagement"
-    )
+    """Login and get authentication token"""
+    conn = await asyncpg.connect(**DB_CONFIG)
 
     row = await conn.fetchrow(
         "SELECT id, password_hash FROM users WHERE email=$1", email
@@ -152,17 +128,14 @@ async def login(email: str, password: str):
 # --------------------------
 @mcp.tool
 async def add_task(token: str, task_name: str, due_date: str = None, priority: str = None):
+    """Add a new task for the authenticated user"""
     user_id = require_user(token)
 
     due_date_obj = None
     if due_date:
         due_date_obj = datetime.strptime(due_date, "%Y-%m-%d").date()
 
-    conn = await asyncpg.connect(
-        host="localhost", port=5432,
-        user="postgres", password="kunal",
-        database="projectmanagement"
-    )
+    conn = await asyncpg.connect(**DB_CONFIG)
 
     await conn.execute(
         """
@@ -176,11 +149,12 @@ async def add_task(token: str, task_name: str, due_date: str = None, priority: s
     return {"message": "Task added"}
 
 
-
-
-
+# --------------------------
+# List Tasks
+# --------------------------
 @mcp.tool
-async def list_tasks(token:str,filters: dict = {}):
+async def list_tasks(token: str, filters: dict = {}):
+    """List tasks with optional filters"""
     user_id = require_user(token) 
     conditions = ["user_id=$1"]
     values = [user_id]
@@ -214,13 +188,7 @@ async def list_tasks(token:str,filters: dict = {}):
 
     sql = "SELECT * FROM tasks WHERE " + " AND ".join(conditions)
 
-    conn = await asyncpg.connect(
-        host="localhost",
-        port=5432,
-        user="postgres",
-        password="kunal",
-        database="projectmanagement"
-    )
+    conn = await asyncpg.connect(**DB_CONFIG)
 
     rows = await conn.fetch(sql, *values)
     await conn.close()
@@ -231,9 +199,11 @@ async def list_tasks(token:str,filters: dict = {}):
     }
 
 
-##Summarize tasks
-
-async def list_tasks2(token:str,filters: dict = {}):
+# --------------------------
+# List Tasks Helper (internal)
+# --------------------------
+async def list_tasks2(token: str, filters: dict = {}):
+    """Internal helper for listing tasks"""
     user_id = require_user(token)
     conditions = ["user_id=$1"]
     values = [user_id]
@@ -267,13 +237,7 @@ async def list_tasks2(token:str,filters: dict = {}):
 
     sql = "SELECT * FROM tasks WHERE " + " AND ".join(conditions)
 
-    conn = await asyncpg.connect(
-        host="localhost",
-        port=5432,
-        user="postgres",
-        password="kunal",
-        database="projectmanagement"
-    )
+    conn = await asyncpg.connect(**DB_CONFIG)
 
     rows = await conn.fetch(sql, *values)
     await conn.close()
@@ -284,13 +248,16 @@ async def list_tasks2(token:str,filters: dict = {}):
     }
 
 
+# --------------------------
+# Task Summary
+# --------------------------
 @mcp.tool
-async def task_summary(token:str,filters: dict = {}):
+async def task_summary(token: str, filters: dict = {}):
     """
     Return a summary of tasks, including total, pending, completed, overdue.
     Optional filters: priority, status, due_date
     """
-    result = await list_tasks2(token,filters)
+    result = await list_tasks2(token, filters)
     rows = result.get('rows', [])
 
     total = len(rows)
@@ -300,14 +267,13 @@ async def task_summary(token:str,filters: dict = {}):
     today = datetime.today().date()
 
     for row in rows:
-        due_date = row['due_date']  # access dict key
+        due_date = row['due_date']
         status = row['status']
 
         if status == 'pending':
             pending += 1
             if due_date:
                 if isinstance(due_date, str):
-                    # If somehow a string, convert to date
                     try:
                         due_date = datetime.strptime(due_date, "%Y-%m-%d").date()
                     except ValueError:
@@ -323,11 +289,14 @@ async def task_summary(token:str,filters: dict = {}):
         "completed": completed,
         "overdue": overdue
     }
+
+
 # --------------------------
 # Complete Task
 # --------------------------
 @mcp.tool
-async def complete_task(token:str,name: str, date: str = None):
+async def complete_task(token: str, name: str, date: str = None):
+    """Mark a task as completed"""
     user_id = require_user(token)
     if date:
         due_date = datetime.strptime(date, "%Y-%m-%d").date()
@@ -345,13 +314,7 @@ async def complete_task(token:str,name: str, date: str = None):
         """
         params = [name, user_id]
 
-    conn = await asyncpg.connect(
-        host="localhost",
-        port=5432,
-        user="postgres",
-        password="kunal",
-        database="projectmanagement"
-    )
+    conn = await asyncpg.connect(**DB_CONFIG)
 
     result = await conn.execute(sql, *params)
     await conn.close()
@@ -366,8 +329,9 @@ async def complete_task(token:str,name: str, date: str = None):
 # Update Task
 # --------------------------
 @mcp.tool
-async def update_task(token:str,task_id: int, name: str = None, due_date: str = None,
+async def update_task(token: str, task_id: int, name: str = None, due_date: str = None,
                       priority: str = None, status: str = None):
+    """Update task details"""
     user_id = require_user(token)
     updates = []
     values = []
@@ -399,13 +363,7 @@ async def update_task(token:str,task_id: int, name: str = None, due_date: str = 
     """
     values.extend([task_id, user_id])
 
-    conn = await asyncpg.connect(
-        host="localhost",
-        port=5432,
-        user="postgres",
-        password="kunal",
-        database="projectmanagement"
-    )
+    conn = await asyncpg.connect(**DB_CONFIG)
 
     result = await conn.execute(sql, *values)
     await conn.close()
@@ -420,15 +378,10 @@ async def update_task(token:str,task_id: int, name: str = None, due_date: str = 
 # Delete Task
 # --------------------------
 @mcp.tool
-async def delete_task(token:str,task_id: int):
+async def delete_task(token: str, task_id: int):
+    """Delete a task"""
     user_id = require_user(token)
-    conn = await asyncpg.connect(
-        host="localhost",
-        port=5432,
-        user="postgres",
-        password="kunal",
-        database="projectmanagement"
-    )
+    conn = await asyncpg.connect(**DB_CONFIG)
 
     result = await conn.execute(
         "DELETE FROM tasks WHERE task_id=$1 AND user_id=$2",
@@ -442,15 +395,22 @@ async def delete_task(token:str,task_id: int):
 
     return {"message": "Task deleted successfully."}
 
+
 # --------------------------
-# Run
+# Test Tool
 # --------------------------
 @mcp.tool
-async def test_tool(number:int):
+async def test_tool(number: int):
+    """Simple test tool that returns the input number"""
     return number    
 
 
+# --------------------------
+# Run
+# --------------------------
 if __name__ == "__main__":
-    initialise_db()
-
-    mcp.run(transport='http',host='0.0.0.0',port=8000,debug=True)
+    # Initialize database tables on first run
+    
+    
+    # Run the MCP server
+    mcp.run(transport='http', host='0.0.0.0', port=8000, debug=True)
