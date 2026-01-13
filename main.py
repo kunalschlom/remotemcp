@@ -8,7 +8,6 @@ import base64
 import json
 from dotenv import load_dotenv
 import os
-import asyncio
 
 # --------------------------
 # Load env
@@ -23,20 +22,13 @@ SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-key").encode()
 mcp = FastMCP(name="project remote management")
 
 # --------------------------
-# DB Pool (GLOBAL)
+# DB Connection (NO POOL)
 # --------------------------
-pool: asyncpg.Pool | None = None
-
-
-async def init_db():
-    global pool
-    pool = await asyncpg.create_pool(
+async def get_conn():
+    return await asyncpg.connect(
         DATABASE_URL,
-        min_size=1,
-        max_size=5,
         ssl="require",
     )
-
 
 # --------------------------
 # Token utils
@@ -49,7 +41,6 @@ def create_token(user_id: int):
     payload_bytes = json.dumps(payload).encode()
     sig = hmac.new(SECRET_KEY, payload_bytes, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(payload_bytes + b"." + sig).decode()
-
 
 def verify_token(token: str):
     try:
@@ -68,13 +59,11 @@ def verify_token(token: str):
     except Exception:
         return None
 
-
 def require_user(token: str):
     uid = verify_token(token)
     if not uid:
         raise Exception("Invalid or expired token")
     return uid
-
 
 # --------------------------
 # Auth: Register
@@ -82,29 +71,34 @@ def require_user(token: str):
 @mcp.tool
 async def register(email: str, password: str):
     hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    conn = await get_conn()
 
-    async with pool.acquire() as conn:
-        try:
-            await conn.execute(
-                "INSERT INTO users (email, password_hash) VALUES ($1, $2)",
-                email,
-                hashed,
-            )
-        except Exception:
-            return {"message": "User already exists"}
+    try:
+        await conn.execute(
+            "INSERT INTO users (email, password_hash) VALUES ($1, $2)",
+            email,
+            hashed,
+        )
+    except Exception:
+        return {"message": "User already exists"}
+    finally:
+        await conn.close()
 
     return {"message": "User registered successfully"}
-
 
 # --------------------------
 # Auth: Login
 # --------------------------
 @mcp.tool
 async def login(email: str, password: str):
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id, password_hash FROM users WHERE email=$1", email
-        )
+    conn = await get_conn()
+
+    row = await conn.fetchrow(
+        "SELECT id, password_hash FROM users WHERE email=$1",
+        email,
+    )
+
+    await conn.close()
 
     if not row:
         return {"message": "Invalid credentials"}
@@ -114,34 +108,43 @@ async def login(email: str, password: str):
 
     return {"token": create_token(row["id"])}
 
-
 # --------------------------
 # Add Task
 # --------------------------
 @mcp.tool
-async def add_task(token: str, task_name: str, due_date: str = None, priority: str = None):
+async def add_task(
+    token: str,
+    task_name: str,
+    due_date: str = None,
+    priority: str = None,
+):
     user_id = require_user(token)
+    conn = await get_conn()
+
     due = datetime.strptime(due_date, "%Y-%m-%d").date() if due_date else None
 
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO tasks (user_id, task_name, due_date, priority, status)
-            VALUES ($1, $2, $3, $4, 'pending')
-            """,
-            user_id,
-            task_name,
-            due,
-            priority,
-        )
+    await conn.execute(
+        """
+        INSERT INTO tasks (user_id, task_name, due_date, priority, status)
+        VALUES ($1, $2, $3, $4, 'pending')
+        """,
+        user_id,
+        task_name,
+        due,
+        priority,
+    )
 
+    await conn.close()
     return {"message": "Task added"}
 
+# --------------------------
+# List Tasks
+# --------------------------
+@mcp.tool
+async def list_tasks(token: str, filters: dict = {}):
+    user_id = require_user(token)
+    conn = await get_conn()
 
-# --------------------------
-# List Tasks (internal)
-# --------------------------
-async def _list_tasks(user_id: int, filters: dict):
     conditions = ["user_id=$1"]
     values = [user_id]
 
@@ -159,22 +162,10 @@ async def _list_tasks(user_id: int, filters: dict):
         values.append(f"%{filters['keyword']}%")
 
     sql = "SELECT * FROM tasks WHERE " + " AND ".join(conditions)
+    rows = await conn.fetch(sql, *values)
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, *values)
-
-    return [dict(r) for r in rows]
-
-
-# --------------------------
-# List Tasks
-# --------------------------
-@mcp.tool
-async def list_tasks(token: str, filters: dict = {}):
-    user_id = require_user(token)
-    rows = await _list_tasks(user_id, filters)
-    return {"rows": rows}
-
+    await conn.close()
+    return {"rows": [dict(r) for r in rows]}
 
 # --------------------------
 # Task Summary
@@ -182,7 +173,14 @@ async def list_tasks(token: str, filters: dict = {}):
 @mcp.tool
 async def task_summary(token: str, filters: dict = {}):
     user_id = require_user(token)
-    rows = await _list_tasks(user_id, filters)
+    conn = await get_conn()
+
+    rows = await conn.fetch(
+        "SELECT status, due_date FROM tasks WHERE user_id=$1",
+        user_id,
+    )
+
+    await conn.close()
 
     today = datetime.today().date()
     pending = completed = overdue = 0
@@ -202,29 +200,29 @@ async def task_summary(token: str, filters: dict = {}):
         "overdue": overdue,
     }
 
-
 # --------------------------
 # Complete Task
 # --------------------------
 @mcp.tool
 async def complete_task(token: str, task_id: int):
     user_id = require_user(token)
+    conn = await get_conn()
 
-    async with pool.acquire() as conn:
-        result = await conn.execute(
-            """
-            UPDATE tasks SET status='completed'
-            WHERE task_id=$1 AND user_id=$2
-            """,
-            task_id,
-            user_id,
-        )
+    result = await conn.execute(
+        """
+        UPDATE tasks SET status='completed'
+        WHERE task_id=$1 AND user_id=$2
+        """,
+        task_id,
+        user_id,
+    )
+
+    await conn.close()
 
     if result.endswith("0"):
         return {"message": "No task found"}
 
     return {"message": "Task completed"}
-
 
 # --------------------------
 # Update Task
@@ -239,7 +237,10 @@ async def update_task(
     status: str = None,
 ):
     user_id = require_user(token)
-    updates, values = [], []
+    conn = await get_conn()
+
+    updates = []
+    values = []
 
     if name:
         updates.append(f"task_name=${len(values)+1}")
@@ -255,22 +256,23 @@ async def update_task(
         values.append(status)
 
     if not updates:
+        await conn.close()
         return {"message": "Nothing to update"}
 
     sql = f"""
         UPDATE tasks SET {', '.join(updates)}
         WHERE task_id=${len(values)+1} AND user_id=${len(values)+2}
     """
-    values.extend([task_id, user_id])
 
-    async with pool.acquire() as conn:
-        result = await conn.execute(sql, *values)
+    values.extend([task_id, user_id])
+    result = await conn.execute(sql, *values)
+
+    await conn.close()
 
     if result.endswith("0"):
         return {"message": "No task found"}
 
     return {"message": "Task updated"}
-
 
 # --------------------------
 # Delete Task
@@ -278,19 +280,20 @@ async def update_task(
 @mcp.tool
 async def delete_task(token: str, task_id: int):
     user_id = require_user(token)
+    conn = await get_conn()
 
-    async with pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM tasks WHERE task_id=$1 AND user_id=$2",
-            task_id,
-            user_id,
-        )
+    result = await conn.execute(
+        "DELETE FROM tasks WHERE task_id=$1 AND user_id=$2",
+        task_id,
+        user_id,
+    )
+
+    await conn.close()
 
     if result.endswith("0"):
         return {"message": "No task found"}
 
     return {"message": "Task deleted"}
-
 
 # --------------------------
 # Test Tool
@@ -299,14 +302,8 @@ async def delete_task(token: str, task_id: int):
 async def test_tool(number: int):
     return number
 
-
 # --------------------------
 # Run Server
 # --------------------------
-async def main():
-    await init_db()
-    mcp.run(transport="http", host="0.0.0.0", port=8000, debug=True)
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    mcp.run(transport="http", host="0.0.0.0", port=8000, debug=True)
