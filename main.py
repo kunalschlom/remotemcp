@@ -1,6 +1,5 @@
 from fastmcp import FastMCP
 import asyncpg
-import psycopg2
 from datetime import datetime, timedelta
 import bcrypt
 import hmac
@@ -9,38 +8,47 @@ import base64
 import json
 from dotenv import load_dotenv
 import os
+import asyncio
 
-# Load environment variables
+# --------------------------
+# Load env
+# --------------------------
 load_dotenv()
-
-# Database configuration
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST"),
-    "port": int(os.getenv("DB_PORT", "5432")),
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-    "database": os.getenv("DB_NAME"),
-    "ssl": "require"  # REQUIRED for Supabase
-}
-
-# Initialize MCP
-mcp = FastMCP(name="project remote management")
-
-# SECRET for token signing
+DATABASE_URL = os.getenv("DATABASE_URL")
 SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-key").encode()
 
 # --------------------------
-# Utility: Token handling
+# MCP Init
+# --------------------------
+mcp = FastMCP(name="project remote management")
+
+# --------------------------
+# DB Pool (GLOBAL)
+# --------------------------
+pool: asyncpg.Pool | None = None
+
+
+async def init_db():
+    global pool
+    pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        ssl="require",
+    )
+
+
+# --------------------------
+# Token utils
 # --------------------------
 def create_token(user_id: int):
     payload = {
         "user_id": user_id,
-        "exp": (datetime.utcnow() + timedelta(hours=2)).timestamp()
+        "exp": (datetime.utcnow() + timedelta(hours=2)).timestamp(),
     }
     payload_bytes = json.dumps(payload).encode()
     sig = hmac.new(SECRET_KEY, payload_bytes, hashlib.sha256).digest()
-    token = base64.urlsafe_b64encode(payload_bytes + b"." + sig).decode()
-    return token
+    return base64.urlsafe_b64encode(payload_bytes + b"." + sig).decode()
 
 
 def verify_token(token: str):
@@ -48,11 +56,8 @@ def verify_token(token: str):
         decoded = base64.urlsafe_b64decode(token.encode())
         payload_bytes, sig = decoded.rsplit(b".", 1)
 
-        expected_sig = hmac.new(
-            SECRET_KEY, payload_bytes, hashlib.sha256
-        ).digest()
-
-        if not hmac.compare_digest(sig, expected_sig):
+        expected = hmac.new(SECRET_KEY, payload_bytes, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, expected):
             return None
 
         payload = json.loads(payload_bytes)
@@ -65,16 +70,10 @@ def verify_token(token: str):
 
 
 def require_user(token: str):
-    user_id = verify_token(token)
-    if not user_id:
+    uid = verify_token(token)
+    if not uid:
         raise Exception("Invalid or expired token")
-    return user_id
-
-
-# --------------------------
-# Database Initialization
-# --------------------------
-
+    return uid
 
 
 # --------------------------
@@ -82,21 +81,18 @@ def require_user(token: str):
 # --------------------------
 @mcp.tool
 async def register(email: str, password: str):
-    """Register a new user"""
     hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
-    conn = await asyncpg.connect(**DB_CONFIG)
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO users (email, password_hash) VALUES ($1, $2)",
+                email,
+                hashed,
+            )
+        except Exception:
+            return {"message": "User already exists"}
 
-    try:
-        await conn.execute(
-            "INSERT INTO users (email, password_hash) VALUES ($1, $2)",
-            email, hashed
-        )
-    except Exception:
-        await conn.close()
-        return {"message": "User already exists"}
-
-    await conn.close()
     return {"message": "User registered successfully"}
 
 
@@ -105,13 +101,10 @@ async def register(email: str, password: str):
 # --------------------------
 @mcp.tool
 async def login(email: str, password: str):
-    """Login and get authentication token"""
-    conn = await asyncpg.connect(**DB_CONFIG)
-
-    row = await conn.fetchrow(
-        "SELECT id, password_hash FROM users WHERE email=$1", email
-    )
-    await conn.close()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, password_hash FROM users WHERE email=$1", email
+        )
 
     if not row:
         return {"message": "Invalid credentials"}
@@ -119,8 +112,7 @@ async def login(email: str, password: str):
     if not bcrypt.checkpw(password.encode(), row["password_hash"].encode()):
         return {"message": "Invalid credentials"}
 
-    token = create_token(row["id"])
-    return {"token": token}
+    return {"token": create_token(row["id"])}
 
 
 # --------------------------
@@ -128,25 +120,50 @@ async def login(email: str, password: str):
 # --------------------------
 @mcp.tool
 async def add_task(token: str, task_name: str, due_date: str = None, priority: str = None):
-    """Add a new task for the authenticated user"""
     user_id = require_user(token)
+    due = datetime.strptime(due_date, "%Y-%m-%d").date() if due_date else None
 
-    due_date_obj = None
-    if due_date:
-        due_date_obj = datetime.strptime(due_date, "%Y-%m-%d").date()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO tasks (user_id, task_name, due_date, priority, status)
+            VALUES ($1, $2, $3, $4, 'pending')
+            """,
+            user_id,
+            task_name,
+            due,
+            priority,
+        )
 
-    conn = await asyncpg.connect(**DB_CONFIG)
-
-    await conn.execute(
-        """
-        INSERT INTO tasks (user_id, task_name, due_date, priority, status)
-        VALUES ($1, $2, $3, $4, 'pending')
-        """,
-        user_id, task_name, due_date_obj, priority
-    )
-
-    await conn.close()
     return {"message": "Task added"}
+
+
+# --------------------------
+# List Tasks (internal)
+# --------------------------
+async def _list_tasks(user_id: int, filters: dict):
+    conditions = ["user_id=$1"]
+    values = [user_id]
+
+    for key in ["priority", "status"]:
+        if key in filters:
+            conditions.append(f"{key}=${len(values)+1}")
+            values.append(filters[key])
+
+    if "due_date" in filters:
+        conditions.append(f"due_date=${len(values)+1}")
+        values.append(datetime.strptime(filters["due_date"], "%Y-%m-%d").date())
+
+    if "keyword" in filters:
+        conditions.append(f"task_name ILIKE ${len(values)+1}")
+        values.append(f"%{filters['keyword']}%")
+
+    sql = "SELECT * FROM tasks WHERE " + " AND ".join(conditions)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *values)
+
+    return [dict(r) for r in rows]
 
 
 # --------------------------
@@ -154,98 +171,9 @@ async def add_task(token: str, task_name: str, due_date: str = None, priority: s
 # --------------------------
 @mcp.tool
 async def list_tasks(token: str, filters: dict = {}):
-    """List tasks with optional filters"""
-    user_id = require_user(token) 
-    conditions = ["user_id=$1"]
-    values = [user_id]
-
-    if "priority" in filters:
-        conditions.append(f"priority=${len(values)+1}")
-        values.append(filters["priority"])
-
-    if "status" in filters:
-        conditions.append(f"status=${len(values)+1}")
-        values.append(filters["status"])
-
-    if "due_date" in filters:
-        due_date = datetime.strptime(filters["due_date"], "%Y-%m-%d").date()
-        conditions.append(f"due_date=${len(values)+1}")
-        values.append(due_date)
-
-    if "due_date_start" in filters:
-        start = datetime.strptime(filters["due_date_start"], "%Y-%m-%d").date()
-        conditions.append(f"due_date>=${len(values)+1}")
-        values.append(start)
-
-    if "due_date_end" in filters:
-        end = datetime.strptime(filters["due_date_end"], "%Y-%m-%d").date()
-        conditions.append(f"due_date<=${len(values)+1}")
-        values.append(end)
-
-    if "keyword" in filters:
-        conditions.append(f"task_name LIKE ${len(values)+1}")
-        values.append(f"%{filters['keyword']}%")
-
-    sql = "SELECT * FROM tasks WHERE " + " AND ".join(conditions)
-
-    conn = await asyncpg.connect(**DB_CONFIG)
-
-    rows = await conn.fetch(sql, *values)
-    await conn.close()
-
-    return {
-        "message": "Tasks fetched successfully.",
-        "rows": [dict(row) for row in rows]
-    }
-
-
-# --------------------------
-# List Tasks Helper (internal)
-# --------------------------
-async def list_tasks2(token: str, filters: dict = {}):
-    """Internal helper for listing tasks"""
     user_id = require_user(token)
-    conditions = ["user_id=$1"]
-    values = [user_id]
-
-    if "priority" in filters:
-        conditions.append(f"priority=${len(values)+1}")
-        values.append(filters["priority"])
-
-    if "status" in filters:
-        conditions.append(f"status=${len(values)+1}")
-        values.append(filters["status"])
-
-    if "due_date" in filters:
-        due_date = datetime.strptime(filters["due_date"], "%Y-%m-%d").date()
-        conditions.append(f"due_date=${len(values)+1}")
-        values.append(due_date)
-
-    if "due_date_start" in filters:
-        start = datetime.strptime(filters["due_date_start"], "%Y-%m-%d").date()
-        conditions.append(f"due_date>=${len(values)+1}")
-        values.append(start)
-
-    if "due_date_end" in filters:
-        end = datetime.strptime(filters["due_date_end"], "%Y-%m-%d").date()
-        conditions.append(f"due_date<=${len(values)+1}")
-        values.append(end)
-
-    if "keyword" in filters:
-        conditions.append(f"task_name LIKE ${len(values)+1}")
-        values.append(f"%{filters['keyword']}%")
-
-    sql = "SELECT * FROM tasks WHERE " + " AND ".join(conditions)
-
-    conn = await asyncpg.connect(**DB_CONFIG)
-
-    rows = await conn.fetch(sql, *values)
-    await conn.close()
-
-    return {
-        "message": "Tasks fetched successfully.",
-        "rows": [dict(row) for row in rows]
-    }
+    rows = await _list_tasks(user_id, filters)
+    return {"rows": rows}
 
 
 # --------------------------
@@ -253,41 +181,25 @@ async def list_tasks2(token: str, filters: dict = {}):
 # --------------------------
 @mcp.tool
 async def task_summary(token: str, filters: dict = {}):
-    """
-    Return a summary of tasks, including total, pending, completed, overdue.
-    Optional filters: priority, status, due_date
-    """
-    result = await list_tasks2(token, filters)
-    rows = result.get('rows', [])
+    user_id = require_user(token)
+    rows = await _list_tasks(user_id, filters)
 
-    total = len(rows)
-    pending = 0
-    completed = 0
-    overdue = 0
     today = datetime.today().date()
+    pending = completed = overdue = 0
 
-    for row in rows:
-        due_date = row['due_date']
-        status = row['status']
-
-        if status == 'pending':
+    for r in rows:
+        if r["status"] == "pending":
             pending += 1
-            if due_date:
-                if isinstance(due_date, str):
-                    try:
-                        due_date = datetime.strptime(due_date, "%Y-%m-%d").date()
-                    except ValueError:
-                        continue
-                if due_date < today:
-                    overdue += 1
-        elif status == 'completed':
+            if r["due_date"] and r["due_date"] < today:
+                overdue += 1
+        elif r["status"] == "completed":
             completed += 1
 
     return {
-        "total": total,
+        "total": len(rows),
         "pending": pending,
         "completed": completed,
-        "overdue": overdue
+        "overdue": overdue,
     }
 
 
@@ -295,83 +207,69 @@ async def task_summary(token: str, filters: dict = {}):
 # Complete Task
 # --------------------------
 @mcp.tool
-async def complete_task(token: str, name: str, date: str = None):
-    """Mark a task as completed"""
+async def complete_task(token: str, task_id: int):
     user_id = require_user(token)
-    if date:
-        due_date = datetime.strptime(date, "%Y-%m-%d").date()
-        sql = """
-            UPDATE tasks
-            SET status='completed'
-            WHERE task_name=$1 AND due_date=$2 AND user_id=$3
-        """
-        params = [name, due_date, user_id]
-    else:
-        sql = """
-            UPDATE tasks
-            SET status='completed'
-            WHERE task_name=$1 AND user_id=$2
-        """
-        params = [name, user_id]
 
-    conn = await asyncpg.connect(**DB_CONFIG)
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE tasks SET status='completed'
+            WHERE task_id=$1 AND user_id=$2
+            """,
+            task_id,
+            user_id,
+        )
 
-    result = await conn.execute(sql, *params)
-    await conn.close()
+    if result.endswith("0"):
+        return {"message": "No task found"}
 
-    if int(result.split()[-1]) == 0:
-        return {"message": "No task found to update."}
-
-    return {"message": "Task successfully marked as completed."}
+    return {"message": "Task completed"}
 
 
 # --------------------------
 # Update Task
 # --------------------------
 @mcp.tool
-async def update_task(token: str, task_id: int, name: str = None, due_date: str = None,
-                      priority: str = None, status: str = None):
-    """Update task details"""
+async def update_task(
+    token: str,
+    task_id: int,
+    name: str = None,
+    due_date: str = None,
+    priority: str = None,
+    status: str = None,
+):
     user_id = require_user(token)
-    updates = []
-    values = []
+    updates, values = [], []
 
     if name:
         updates.append(f"task_name=${len(values)+1}")
         values.append(name)
-
     if due_date:
-        due = datetime.strptime(due_date, "%Y-%m-%d").date()
         updates.append(f"due_date=${len(values)+1}")
-        values.append(due)
-
+        values.append(datetime.strptime(due_date, "%Y-%m-%d").date())
     if priority:
         updates.append(f"priority=${len(values)+1}")
         values.append(priority)
-
     if status:
         updates.append(f"status=${len(values)+1}")
         values.append(status)
 
     if not updates:
-        return {"message": "Nothing to update."}
+        return {"message": "Nothing to update"}
 
     sql = f"""
-        UPDATE tasks
-        SET {', '.join(updates)}
+        UPDATE tasks SET {', '.join(updates)}
         WHERE task_id=${len(values)+1} AND user_id=${len(values)+2}
     """
     values.extend([task_id, user_id])
 
-    conn = await asyncpg.connect(**DB_CONFIG)
+    async with pool.acquire() as conn:
+        result = await conn.execute(sql, *values)
 
-    result = await conn.execute(sql, *values)
-    await conn.close()
+    if result.endswith("0"):
+        return {"message": "No task found"}
 
-    if int(result.split()[-1]) == 0:
-        return {"message": "No task found to update."}
-
-    return {"message": "Task updated successfully."}
+    return {"message": "Task updated"}
 
 
 # --------------------------
@@ -379,21 +277,19 @@ async def update_task(token: str, task_id: int, name: str = None, due_date: str 
 # --------------------------
 @mcp.tool
 async def delete_task(token: str, task_id: int):
-    """Delete a task"""
     user_id = require_user(token)
-    conn = await asyncpg.connect(**DB_CONFIG)
 
-    result = await conn.execute(
-        "DELETE FROM tasks WHERE task_id=$1 AND user_id=$2",
-        task_id, user_id
-    )
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM tasks WHERE task_id=$1 AND user_id=$2",
+            task_id,
+            user_id,
+        )
 
-    await conn.close()
+    if result.endswith("0"):
+        return {"message": "No task found"}
 
-    if int(result.split()[-1]) == 0:
-        return {"message": "No task found to delete."}
-
-    return {"message": "Task deleted successfully."}
+    return {"message": "Task deleted"}
 
 
 # --------------------------
@@ -401,16 +297,16 @@ async def delete_task(token: str, task_id: int):
 # --------------------------
 @mcp.tool
 async def test_tool(number: int):
-    """Simple test tool that returns the input number"""
-    return number    
+    return number
 
 
 # --------------------------
-# Run
+# Run Server
 # --------------------------
+async def main():
+    await init_db()
+    mcp.run(transport="http", host="0.0.0.0", port=8000, debug=True)
+
+
 if __name__ == "__main__":
-    # Initialize database tables on first run
-    
-    
-    # Run the MCP server
-    mcp.run(transport='http', host='0.0.0.0', port=8000, debug=True)
+    asyncio.run(main())
