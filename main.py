@@ -445,7 +445,9 @@ async def delete_task(token:str,task_id: int):
 # --------------------------
 # Run
 # --------------------------
-    
+@mcp.tool
+async def test_tool(number:int):
+    return number    
 
 
 if __name__ == "__main__":
